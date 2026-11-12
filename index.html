@@ -1,0 +1,206 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<meta name="robots" content="noindex, nofollow">
+<title>Approve</title>
+<style>
+  :root { --bg:#f6f6f4; --fg:#1b1b1a; --muted:#6b6b66; --card:#fff; --line:#e2e2dc; --accent:#1f5fbf; --ok:#1d7a3a; --bad:#b3261e; }
+  @media (prefers-color-scheme: dark) { :root { --bg:#121212; --fg:#ecece8; --muted:#a0a09a; --card:#1d1d1c; --line:#33332f; --accent:#7fb0ff; --ok:#6fd08c; --bad:#ff8a80; } }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg); font:16px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+  main { max-width:480px; margin:0 auto; padding:24px 16px 48px; }
+  h1 { font-size:20px; margin:0 0 4px; }
+  .sub { color:var(--muted); margin:0 0 20px; font-size:14px; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:16px; margin-bottom:16px; }
+  dl { margin:0; display:grid; grid-template-columns:auto 1fr; gap:6px 12px; font-size:15px; }
+  dt { color:var(--muted); } dd { margin:0; word-break:break-word; }
+  button { width:100%; padding:14px; font-size:17px; border-radius:10px; border:0; background:var(--accent); color:#fff; font-weight:600; }
+  @media (prefers-color-scheme: dark) { button { color:#0b1a33; } }
+  button:disabled { opacity:.45; }
+  #status { margin-top:16px; font-size:15px; min-height:1.5em; }
+  .ok { color:var(--ok); } .bad { color:var(--bad); }
+  .warn { font-size:13px; color:var(--muted); margin-top:12px; }
+</style>
+</head>
+<body>
+<main>
+  <h1 id="title">Approve</h1>
+  <p class="sub" id="subtitle">Loading…</p>
+  <div class="card" id="details" hidden><dl id="dl"></dl></div>
+  <button id="go" hidden></button>
+  <div id="status"></div>
+  <p class="warn" id="warn" hidden>Only approve if you expected this request. If you didn't, close this page.</p>
+</main>
+
+<!-- core: pure WebCrypto, no DOM (a Node test runs this block) -->
+<script id="core">
+const KPU = {
+  enc: b => { let s = ''; for (const x of new Uint8Array(b)) s += String.fromCharCode(x); return btoa(s).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, ''); },
+  dec: s => { s = String(s).replace(/-/g, '+').replace(/_/g, '/'); while (s.length % 4) s += '='; const r = atob(s); const u = new Uint8Array(r.length); for (let i = 0; i < r.length; i++) u[i] = r.charCodeAt(i); return u; },
+  utf8: s => new TextEncoder().encode(s),
+  // Everything acted on is inside the signature; changing any field breaks it.
+  sigMessage: p => ['kpu1', p.m, p.sid, p.dev, p.eph, p.ts, p.host, p.salt, p.rt].join('\n'),
+  async sha256(bytes) { return new Uint8Array(await crypto.subtle.digest('SHA-256', bytes)); },
+  async verifyRequest(p) {
+    for (const k of ['m', 'sid', 'dev', 'eph', 'ts', 'host', 'salt', 'rt', 'sig']) if (!p[k]) return `missing ${k}`;
+    if (p.m !== 'unlock' && p.m !== 'enroll') return 'unknown mode';
+    if (!/^[A-Za-z0-9_-]{16,64}$/.test(p.rt)) return 'bad reply topic';
+    const key = await crypto.subtle.importKey('raw', KPU.dec(p.dev), { name: 'ECDSA', namedCurve: 'P-256' }, false, ['verify']);
+    const ok = await crypto.subtle.verify({ name: 'ECDSA', hash: 'SHA-256' }, key, KPU.dec(p.sig), KPU.utf8(KPU.sigMessage(p)));
+    return ok ? null : 'signature does not match';
+  },
+  // The passkey's user.id is sha256(device public key), fixed at setup: a request signed by any other key is refused
+  // after the fingerprint, before anything leaves.
+  async devicePinned(p, userHandle) {
+    if (!userHandle) return false;
+    const want = await KPU.sha256(KPU.dec(p.dev));
+    const got = new Uint8Array(userHandle);
+    return got.length === want.length && got.every((x, i) => x === want[i]);
+  },
+  // Encrypt the reply to the requester's one-time key.
+  async sealReply(p, payload) {
+    const mine = await crypto.subtle.generateKey({ name: 'ECDH', namedCurve: 'P-256' }, true, ['deriveBits']);
+    const theirs = await crypto.subtle.importKey('raw', KPU.dec(p.eph), { name: 'ECDH', namedCurve: 'P-256' }, false, []);
+    const shared = await crypto.subtle.deriveBits({ name: 'ECDH', public: theirs }, mine.privateKey, 256);
+    const hk = await crypto.subtle.importKey('raw', shared, 'HKDF', false, ['deriveKey']);
+    const aes = await crypto.subtle.deriveKey({ name: 'HKDF', hash: 'SHA-256', salt: KPU.utf8(p.sid), info: KPU.utf8('kpu1-reply') }, hk, { name: 'AES-GCM', length: 256 }, false, ['encrypt']);
+    const iv = crypto.getRandomValues(new Uint8Array(12));
+    const ct = await crypto.subtle.encrypt({ name: 'AES-GCM', iv, additionalData: KPU.utf8(p.sid) }, aes, KPU.utf8(JSON.stringify(payload)));
+    const pub = await crypto.subtle.exportKey('raw', mine.publicKey);
+    return { kpu: 1, sid: p.sid, pub: KPU.enc(pub), iv: KPU.enc(iv), ct: KPU.enc(ct) };
+  },
+};
+</script>
+
+<script>
+const $ = id => document.getElementById(id);
+const say = (msg, cls = '') => { $('status').className = cls; $('status').textContent = msg; };
+const p = Object.fromEntries(new URLSearchParams(location.hash.slice(1)));
+const MAX_AGE_MIN = 60;
+
+function show(rows) {
+  $('dl').innerHTML = '';
+  for (const [k, v] of rows) { const dt = document.createElement('dt'); dt.textContent = k; const dd = document.createElement('dd'); dd.textContent = v; $('dl').append(dt, dd); }
+  $('details').hidden = false;
+}
+
+async function post(body) {
+  const r = await fetch(`https://ntfy.sh/${p.rt}`, { method: 'POST', headers: { 'Content-Type': 'text/plain' }, body: JSON.stringify(body) });
+  if (!r.ok) throw new Error(`relay HTTP ${r.status}`);
+}
+
+// Read the acknowledgement from the same one-time topic.
+async function waitAck(sinceSec) {
+  for (let i = 0; i < 30; i++) {
+    await new Promise(r => setTimeout(r, 3000));
+    try {
+      const r = await fetch(`https://ntfy.sh/${p.rt}/json?poll=1&since=${sinceSec}`);
+      for (const line of (await r.text()).split('\n')) {
+        let m; try { m = JSON.parse(JSON.parse(line).message); } catch { continue; }
+        if (m.sid === p.sid && m.ack) return m;
+      }
+    } catch { /* keep trying */ }
+  }
+  return null;
+}
+
+function prfOf(cred) { const r = cred.getClientExtensionResults?.().prf?.results?.first; return r ? new Uint8Array(r) : null; }
+
+async function getWithPrf() {
+  return navigator.credentials.get({ publicKey: {
+    challenge: crypto.getRandomValues(new Uint8Array(32)), rpId: location.hostname, userVerification: 'required', timeout: 120000,
+    extensions: { prf: { eval: { first: KPU.dec(p.salt) } } },
+  } });
+}
+
+async function finish(payload) {
+  say('Sending…');
+  const since = Math.floor(Date.now() / 1000) - 5;
+  await post(await KPU.sealReply(p, payload));
+  say('Sent. Waiting for confirmation…');
+  const ack = await waitAck(since);
+  if (!ack) return say('Sent, but no confirmation within 90 s. Check the computer.', 'bad');
+  if (ack.ack === 'unlocked') return say('✓ Approved.', 'ok');
+  if (ack.ack === 'enrolled') return say('✓ Set up. You can close this page.', 'ok');
+  say(`Refused by the computer: ${ack.err || ack.ack}`, 'bad');
+}
+
+async function unlock() {
+  $('go').disabled = true;
+  try {
+    say('Waiting for fingerprint…');
+    const cred = await getWithPrf();
+    if (!await KPU.devicePinned(p, cred.response.userHandle)) return say('REFUSED: this request was not signed by your computer. Nothing was sent.', 'bad');
+    const prf = prfOf(cred);
+    if (!prf) return say('This passkey gave no PRF secret. Nothing was sent.', 'bad');
+    await finish({ prf: KPU.enc(prf) });
+  } catch (e) { say(`Failed: ${e.message}`, 'bad'); $('go').disabled = false; }
+}
+
+async function enroll() {
+  $('go').disabled = true;
+  try {
+    say('Creating the passkey…');
+    const devHash = await KPU.sha256(KPU.dec(p.dev));
+    const cred = await navigator.credentials.create({ publicKey: {
+      challenge: crypto.getRandomValues(new Uint8Array(32)),
+      rp: { id: location.hostname, name: 'Approve' },
+      user: { id: devHash, name: `approve-${p.host}`, displayName: `Approve (${p.host})` },
+      pubKeyCredParams: [{ type: 'public-key', alg: -7 }, { type: 'public-key', alg: -257 }],
+      authenticatorSelection: { residentKey: 'required', userVerification: 'required' },
+      timeout: 120000,
+      extensions: { prf: { eval: { first: KPU.dec(p.salt) } } },
+    } });
+    const ext = cred.getClientExtensionResults?.().prf;
+    if (ext && ext.enabled === false) return say('This phone\'s passkey manager does not support PRF. Use Google Password Manager.', 'bad');
+    let prf = prfOf(cred);
+    if (!prf) {
+      // Most managers only give the secret on a sign-in, so confirm once more.
+      say('Passkey created. Tap again to confirm with your fingerprint.');
+      $('go').textContent = 'Confirm with fingerprint';
+      $('go').disabled = false;
+      $('go').onclick = async () => {
+        $('go').disabled = true;
+        try {
+          const c2 = await getWithPrf();
+          if (!await KPU.devicePinned(p, c2.response.userHandle)) return say('The passkey picked is not the one just created. Nothing was sent.', 'bad');
+          const s = prfOf(c2);
+          if (!s) return say('This passkey gave no PRF secret. Nothing was sent.', 'bad');
+          await finish({ prf: KPU.enc(s), cred: KPU.enc(cred.rawId) });
+        } catch (e) { say(`Failed: ${e.message}`, 'bad'); $('go').disabled = false; }
+      };
+      return;
+    }
+    await finish({ prf: KPU.enc(prf), cred: KPU.enc(cred.rawId) });
+  } catch (e) { say(`Failed: ${e.message}`, 'bad'); $('go').disabled = false; }
+}
+
+(async () => {
+  if (!p.m) { $('subtitle').textContent = 'Nothing to approve.'; return; }
+  const bad = await KPU.verifyRequest(p).catch(e => e.message);
+  if (bad) { $('subtitle').textContent = `This link is not valid (${bad}).`; return; }
+  const ageMin = (Date.now() / 1000 - Number(p.ts)) / 60;
+  if (!(ageMin < MAX_AGE_MIN && ageMin > -5)) { $('subtitle').textContent = `This request is ${Math.round(ageMin)} min old. Open the newest notification.`; return; }
+  if (!window.PublicKeyCredential) { $('subtitle').textContent = 'This browser has no passkey support. Open it in Chrome.'; return; }
+  const when = new Date(Number(p.ts) * 1000).toLocaleString();
+  show([['Computer', p.host], ['Requested', `${when} (${Math.max(0, Math.round(ageMin))} min ago)`], ['Request', p.sid.slice(0, 8)]]);
+  if (p.m === 'unlock') {
+    $('title').textContent = 'Approve request';
+    $('subtitle').textContent = 'A request from your computer is waiting.';
+    $('go').textContent = 'Approve with fingerprint';
+    $('go').onclick = unlock;
+    $('warn').hidden = false;
+  } else {
+    $('title').textContent = 'Set up';
+    $('subtitle').textContent = 'Creates a passkey on this phone for approving requests from your computer.';
+    $('go').textContent = 'Create passkey';
+    $('go').onclick = enroll;
+  }
+  $('go').hidden = false;
+})();
+</script>
+</body>
+</html>
