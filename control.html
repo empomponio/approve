@@ -1,0 +1,207 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<meta name="robots" content="noindex, nofollow">
+<title>Control</title>
+<style>
+  :root { --bg:#f6f6f4; --fg:#1b1b1a; --muted:#6b6b66; --card:#fff; --line:#e2e2dc; --accent:#1f5fbf; --ok:#1d7a3a; --bad:#b3261e; --stop:#b3261e; }
+  @media (prefers-color-scheme: dark) { :root { --bg:#121212; --fg:#ecece8; --muted:#a0a09a; --card:#1d1d1c; --line:#33332f; --accent:#7fb0ff; --ok:#6fd08c; --bad:#ff8a80; --stop:#ff8a80; } }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg); font:16px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+  main { max-width:480px; margin:0 auto; padding:20px 16px 48px; }
+  h1 { font-size:20px; margin:0 0 2px; }
+  .sub { color:var(--muted); margin:0 0 14px; font-size:14px; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:12px 14px; margin-bottom:12px; }
+  button { padding:10px 12px; font-size:15px; border-radius:9px; border:1px solid var(--line); background:var(--card); color:var(--fg); font-weight:600; }
+  button.primary { background:var(--accent); color:#fff; border:0; width:100%; padding:14px; font-size:17px; }
+  button.danger { background:var(--stop); color:#fff; border:0; }
+  @media (prefers-color-scheme: dark) { button.primary, button.danger { color:#140b0b; } }
+  button:disabled { opacity:.45; }
+  .row2 { display:grid; grid-template-columns:1fr 1fr; gap:10px; margin-bottom:12px; }
+  .row2 button { width:100%; padding:14px; font-size:16px; }
+  .bot { display:flex; align-items:center; gap:8px; padding:9px 0; border-top:1px solid var(--line); }
+  .bot:first-child { border-top:0; }
+  .bot .n { flex:1; min-width:0; }
+  .bot .n b { display:block; font-size:15px; }
+  .bot .n span { font-size:12.5px; color:var(--muted); }
+  .dot { width:10px; height:10px; border-radius:50%; flex:none; background:var(--muted); }
+  .dot.on { background:var(--ok); } .dot.off { background:var(--bad); }
+  #status { margin:10px 0; font-size:15px; min-height:1.4em; }
+  .ok { color:var(--ok); } .bad { color:var(--bad); }
+  .muted { color:var(--muted); font-size:13px; }
+</style>
+</head>
+<body>
+<main>
+  <h1 id="title">Bot control</h1>
+  <p class="sub" id="subtitle">Loading…</p>
+  <div id="status"></div>
+  <div id="app" hidden>
+    <div class="row2">
+      <button class="danger" id="stopall">Stop ALL</button>
+      <button id="startall">Start ALL</button>
+    </div>
+    <div class="card" id="bots"></div>
+    <button id="refresh" style="width:100%">Refresh status</button>
+    <p class="muted" id="foot"></p>
+  </div>
+  <button class="primary" id="go" hidden></button>
+</main>
+
+<script>
+const $ = id => document.getElementById(id);
+const enc = b => { let s = ''; for (const x of new Uint8Array(b)) s += String.fromCharCode(x); return btoa(s).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, ''); };
+const dec = s => { s = String(s).replace(/-/g, '+').replace(/_/g, '/'); while (s.length % 4) s += '='; const r = atob(s); const u = new Uint8Array(r.length); for (let i = 0; i < r.length; i++) u[i] = r.charCodeAt(i); return u; };
+const utf8 = s => new TextEncoder().encode(s);
+const say = (msg, cls = '') => { $('status').className = cls; $('status').textContent = msg; };
+const p = Object.fromEntries(new URLSearchParams(location.hash.slice(1)));
+const KEY = 'cy_control';
+const load = () => { try { return JSON.parse(localStorage.getItem(KEY) || 'null'); } catch { return null; } };
+const save = o => { try { localStorage.setItem(KEY, JSON.stringify(o)); return true; } catch { return false; } };
+const nonce = () => enc(crypto.getRandomValues(new Uint8Array(12)));
+const TOPIC = /^[A-Za-z0-9_-]{16,64}$/;
+
+async function post(topic, body) {
+  const r = await fetch(`https://ntfy.sh/${topic}`, { method: 'POST', headers: { 'Content-Type': 'text/plain' }, body: JSON.stringify(body) });
+  if (!r.ok) throw new Error(`relay HTTP ${r.status}`);
+}
+async function poll(topic, since) {
+  const r = await fetch(`https://ntfy.sh/${topic}/json?poll=1&since=${since}`);
+  const out = [];
+  for (const line of (await r.text()).split('\n')) { try { out.push(JSON.parse(JSON.parse(line).message)); } catch {} }
+  return out;
+}
+
+// ---------- enrollment (link pushed by `node tools/control_listener.mjs enroll`) ----------
+async function enroll() {
+  $('go').disabled = true;
+  try {
+    say('Creating the passkey…');
+    const cred = await navigator.credentials.create({ publicKey: {
+      challenge: crypto.getRandomValues(new Uint8Array(32)),
+      rp: { id: location.hostname, name: 'Control' },
+      user: { id: crypto.getRandomValues(new Uint8Array(16)), name: `control-${p.host}`, displayName: `Control (${p.host})` },
+      pubKeyCredParams: [{ type: 'public-key', alg: -7 }],
+      authenticatorSelection: { residentKey: 'preferred', userVerification: 'required' },
+      timeout: 120000,
+    } });
+    const pub = cred.response.getPublicKey?.(), alg = cred.response.getPublicKeyAlgorithm?.();
+    if (!pub || alg !== -7) return say('This browser did not give the passkey\'s public key. Use Chrome.', 'bad');
+    say('Sending…');
+    const since = Math.floor(Date.now() / 1000) - 5;
+    await post(p.rt, { pub: enc(pub), alg, cred: enc(cred.rawId) });
+    for (let i = 0; i < 30; i++) {
+      await new Promise(r => setTimeout(r, 3000));
+      const acks = await poll(p.rt, since).catch(() => []);
+      if (acks.some(m => m.ack === 'enrolled')) {
+        if (!save({ host: p.host, ct: p.ct, st: p.st, cred: enc(cred.rawId) })) return say('Set up on the server, but this browser would not save it (private mode?).', 'bad');
+        history.replaceState(null, '', location.pathname);
+        say('✓ Set up. Bookmark this page or add it to your home screen.', 'ok');
+        $('go').hidden = true;
+        return main();
+      }
+    }
+    say('Sent, but no confirmation within 90 s. Check the server.', 'bad');
+  } catch (e) { say(`Failed: ${e.message}`, 'bad'); $('go').disabled = false; }
+}
+
+// ---------- control ----------
+let cfg = null, busy = false;
+function render(st) {
+  if (!st?.bots) return;
+  $('subtitle').textContent = `${cfg.host} · ${st.summary}`;
+  $('foot').textContent = `Status as of ${new Date(st.at).toLocaleTimeString()}. Every command asks for your fingerprint.`;
+  const box = $('bots'); box.innerHTML = '';
+  for (const b of st.bots) {
+    const on = b.state === 'active';
+    const row = document.createElement('div'); row.className = 'bot';
+    const dot = document.createElement('div'); dot.className = `dot ${on ? 'on' : 'off'}`;
+    const n = document.createElement('div'); n.className = 'n';
+    const t = document.createElement('b'); t.textContent = b.name;
+    const s = document.createElement('span'); s.textContent = on ? 'running' : (b.ownerStopped ? 'stopped by you' : b.state);
+    n.append(t, s); row.append(dot, n);
+    if (on) {
+      const r = document.createElement('button'); r.textContent = 'Restart'; r.onclick = () => send('restart', b.label, `Restart ${b.name}`);
+      const x = document.createElement('button'); x.textContent = 'Stop'; x.className = 'danger'; x.onclick = () => send('stop', b.label, `Stop ${b.name}`);
+      row.append(r, x);
+    } else {
+      const g = document.createElement('button'); g.textContent = 'Start'; g.onclick = () => send('start', b.label, `Start ${b.name}`);
+      row.append(g);
+    }
+    box.append(row);
+  }
+}
+async function waitReply(n, sinceSec, maxS) {
+  for (let i = 0; i < maxS / 3; i++) {
+    await new Promise(r => setTimeout(r, 3000));
+    const hit = (await poll(cfg.st, sinceSec).catch(() => [])).find(m => m.nonce === n);
+    if (hit) return hit;
+  }
+  return null;
+}
+async function refresh() {
+  if (busy) return;
+  busy = true; say('Asking the server…');
+  try {
+    const n = nonce(), since = Math.floor(Date.now() / 1000) - 5;
+    await post(cfg.ct, { msg: JSON.stringify({ v: 1, cmd: 'status', ts: Date.now(), nonce: n }) });
+    const r = await waitReply(n, since, 45);
+    if (r) { render(r); say(''); } else say('No answer from the server within 45 s.', 'bad');
+  } catch (e) { say(`Failed: ${e.message}`, 'bad'); }
+  busy = false;
+}
+async function send(cmd, target, label) {
+  if (busy) return;
+  busy = true;
+  try {
+    const n = nonce();
+    const msg = JSON.stringify({ v: 1, cmd, target: target || null, ts: Date.now(), nonce: n, host: cfg.host });
+    say(`${label}: confirm with your fingerprint…`);
+    const a = await navigator.credentials.get({ publicKey: {
+      challenge: new Uint8Array(await crypto.subtle.digest('SHA-256', utf8(msg))),
+      rpId: location.hostname, userVerification: 'required', timeout: 120000,
+      allowCredentials: [{ type: 'public-key', id: dec(cfg.cred) }],
+    } });
+    const since = Math.floor(Date.now() / 1000) - 5;
+    await post(cfg.ct, { msg, cred: enc(a.rawId), cdj: enc(a.response.clientDataJSON), ad: enc(a.response.authenticatorData), sig: enc(a.response.signature) });
+    say(`${label}: sent, waiting for the server…`);
+    const r = await waitReply(n, since, cmd === 'start-all' ? 180 : 60);
+    if (r) { render(r); say(`${r.ok ? '✓' : '✗'} ${r.text}`, r.ok ? 'ok' : 'bad'); }
+    else say(`${label}: still running on the server. You'll get a push when it's done.`, '');
+  } catch (e) { say(`${label} failed: ${e.message}`, 'bad'); }
+  busy = false;
+}
+
+async function main() {
+  cfg = load();
+  if (!cfg || !TOPIC.test(cfg.ct || '') || !TOPIC.test(cfg.st || '')) { $('subtitle').textContent = 'Not set up on this phone. Ask for a setup link.'; return; }
+  $('app').hidden = false;
+  $('subtitle').textContent = cfg.host;
+  $('stopall').onclick = () => send('stop-all', null, 'Stop ALL');
+  $('startall').onclick = () => send('start-all', null, 'Start ALL');
+  $('refresh').onclick = refresh;
+  const last = (await poll(cfg.st, '12h').catch(() => [])).filter(m => m.bots).pop();
+  if (last) render(last);
+  refresh();
+}
+
+(async () => {
+  if (!window.PublicKeyCredential) { $('subtitle').textContent = 'This browser has no passkey support. Open it in Chrome.'; return; }
+  if (p.m === 'enroll') {
+    for (const k of ['host', 'ct', 'st', 'rt', 'ts']) if (!p[k]) { $('subtitle').textContent = `This setup link is incomplete (${k}).`; return; }
+    if (![p.ct, p.st, p.rt].every(t => TOPIC.test(t))) { $('subtitle').textContent = 'This setup link is not valid.'; return; }
+    const ageMin = (Date.now() / 1000 - Number(p.ts)) / 60;
+    if (!(ageMin < 15 && ageMin > -5)) { $('subtitle').textContent = 'This setup link has expired. Ask for a new one.'; return; }
+    $('title').textContent = 'Set up bot control';
+    $('subtitle').textContent = `Creates a "Control (${p.host})" passkey on this phone. Every stop/start will need your fingerprint.`;
+    $('go').textContent = 'Create passkey'; $('go').onclick = enroll; $('go').hidden = false;
+    return;
+  }
+  main();
+})();
+</script>
+</body>
+</html>
