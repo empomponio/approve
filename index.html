@@ -109,9 +109,14 @@ async function waitAck(sinceSec) {
 
 function prfOf(cred) { const r = cred.getClientExtensionResults?.().prf?.results?.first; return r ? new Uint8Array(r) : null; }
 
-async function getWithPrf() {
+// Only THIS computer's passkey is offered when the link names it (`cred`, 2026-11-25: the phone listed every passkey of
+// the site — both computers' Approve and the Control one). If that narrowed request fails, the next tap offers the full
+// list again, so a wrong or missing id can never lock the owner out.
+let narrow = /^[A-Za-z0-9_-]{16,}$/.test(p.cred || '');
+async function getWithPrf({ useCred = false } = {}) {
   return navigator.credentials.get({ publicKey: {
     challenge: crypto.getRandomValues(new Uint8Array(32)), rpId: location.hostname, userVerification: 'required', timeout: 120000,
+    ...(useCred && narrow ? { allowCredentials: [{ type: 'public-key', id: KPU.dec(p.cred) }] } : {}),
     extensions: { prf: { eval: { first: KPU.dec(p.salt) } } },
   } });
 }
@@ -132,12 +137,16 @@ async function unlock() {
   $('go').disabled = true;
   try {
     say('Waiting for fingerprint…');
-    const cred = await getWithPrf();
+    const cred = await getWithPrf({ useCred: true });
     if (!await KPU.devicePinned(p, cred.response.userHandle)) return say('REFUSED: this request was not signed by your computer. Nothing was sent.', 'bad');
     const prf = prfOf(cred);
     if (!prf) return say('This passkey gave no PRF secret. Nothing was sent.', 'bad');
     await finish({ prf: KPU.enc(prf) });
-  } catch (e) { say(`Failed: ${e.message}`, 'bad'); $('go').disabled = false; }
+  } catch (e) {
+    if (narrow) { narrow = false; say(`Failed: ${e.message}. Tap again to pick the passkey from the full list.`, 'bad'); }
+    else say(`Failed: ${e.message}`, 'bad');
+    $('go').disabled = false;
+  }
 }
 
 async function enroll() {
