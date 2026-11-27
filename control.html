@@ -32,6 +32,8 @@
   #status { margin:10px 0; font-size:15px; min-height:1.4em; }
   .ok { color:var(--ok); } .bad { color:var(--bad); }
   .muted { color:var(--muted); font-size:13px; }
+  .lanehead { font-size:13px; font-weight:700; color:var(--bad); margin:0 0 2px; text-transform:uppercase; letter-spacing:.03em; }
+  .bot .n a { color:var(--accent); font-size:12.5px; }
 </style>
 </head>
 <body>
@@ -44,6 +46,7 @@
       <button class="danger" id="stopall">Stop ALL</button>
       <button id="startall">Start ALL</button>
     </div>
+    <div class="card" id="lanes" hidden></div>
     <div class="card" id="bots"></div>
     <button id="refresh" style="width:100%">Refresh status</button>
     <p class="muted" id="foot"></p>
@@ -114,6 +117,24 @@ function render(st) {
   if (!st?.bots) return;
   $('subtitle').textContent = `${cfg.host} · ${st.summary}`;
   $('foot').textContent = `Status as of ${new Date(st.at).toLocaleTimeString()}. Every command asks for your fingerprint.`;
+  // halted cross-bot lanes (listener 11-27+; an older listener sends no `lanes`: card stays hidden)
+  const halted = (st.lanes || []).filter(l => l.halted), lb = $('lanes');
+  lb.innerHTML = ''; lb.hidden = !halted.length;
+  if (halted.length) { const h = document.createElement('p'); h.className = 'lanehead'; h.textContent = 'Cross bot: halted'; lb.append(h); }
+  for (const l of halted) {
+    const row = document.createElement('div'); row.className = 'bot';
+    const dot = document.createElement('div'); dot.className = 'dot off';
+    const n = document.createElement('div'); n.className = 'n';
+    const t = document.createElement('b'); t.textContent = l.lane === 'all' ? 'WHOLE cross bot' : `${l.lane} lane`;
+    const when = l.at ? ` (${new Date(l.at).toLocaleString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })})` : '';
+    const s = document.createElement('span');
+    s.textContent = `${l.reason}${when}${l.safe ? ' · safe mode: the next failed resale halts it again' : ''}${l.rearmable ? '' : ' · clear this one by hand'}`;
+    n.append(t, s);
+    if (l.url) { const a = document.createElement('a'); a.href = l.url; a.target = '_blank'; a.rel = 'noopener'; a.textContent = ' card'; n.append(a); }
+    row.append(dot, n);
+    if (l.rearmable) { const g = document.createElement('button'); g.textContent = 'Re-open'; g.onclick = () => send('rearm', l.lane, `Re-open ${l.lane} lane`); row.append(g); }
+    lb.append(row);
+  }
   const box = $('bots'); box.innerHTML = '';
   for (const b of st.bots) {
     const on = b.state === 'active';
@@ -168,7 +189,7 @@ async function send(cmd, target, label) {
     const since = Math.floor(Date.now() / 1000) - 5;
     await post(cfg.ct, { msg, cred: enc(a.rawId), cdj: enc(a.response.clientDataJSON), ad: enc(a.response.authenticatorData), sig: enc(a.response.signature) });
     say(`${label}: sent, waiting for the server…`);
-    const r = await waitReply(n, since, cmd === 'start-all' ? 180 : 60);
+    const r = await waitReply(n, since, cmd === 'start-all' || cmd === 'rearm' ? 180 : 60);
     if (r) { render(r); say(`${r.ok ? '✓' : '✗'} ${r.text}`, r.ok ? 'ok' : 'bad'); }
     else say(`${label}: still running on the server. You'll get a push when it's done.`, '');
   } catch (e) { say(`${label} failed: ${e.message}`, 'bad'); }
